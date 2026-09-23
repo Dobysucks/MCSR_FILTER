@@ -1,0 +1,1 @@
+{"version": "26.2", "conditions": [{"type": "structure_near", "any_of": ["village"], "radius": 112, "anchor": "spawn"}]}

@@ -1,0 +1,18 @@
+{
+  "minecraft_version": "26.2",
+  "filter_version": "MCSR-26.2-ADAPTED-v2",
+  "target_seeds": 500000,
+  "target_overworld": 500000,
+  "target_nether": 500000,
+  "workers": 0,
+  "master_rng_seed": null,
+  "filters": {
+    "village": true,
+    "shipwreck": true,
+    "desert_temple": true,
+    "ruined_portal": true,
+    "buried_treasure": true,
+    "bastion": true,
+    "fortress": true
+  }
+}

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+
+*.spec
+mcsr_seed_cache.db
+mcsr_26_2_seed_cache.db
+overworld_seeds.txt
+nether_seeds.txt
+generation_state.json
+logs/
+
+workdir/
+mcsr_filter_backup/

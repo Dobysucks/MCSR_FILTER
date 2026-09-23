@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import random
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+from .cache import MAX_SEED, MIN_SEED, SeedCache
+from .config import AppConfig
+from .engine import GenerationUnavailableError, WorldGenerationProvider
+
+
+@dataclass
+class Progress:
+    target: int = 0
+    found: int = 0
+    candidates: int = 0
+    rejected: int = 0
+    duplicates: int = 0
+    started_at: float = 0.0
+    finished: bool = False
+    error: str | None = None
+
+
+class CandidateStream:
+    def __init__(self, master_seed: int | None = None):
+        self.random = random.Random(master_seed) if master_seed is not None else random.SystemRandom()
+        self._lock = threading.Lock()
+        self._seen: set[int] = set()
+
+    def next(self) -> int:
+        with self._lock:
+            while True:
+                value = self.random.randint(MIN_SEED, MAX_SEED)
+                if value not in self._seen:
+                    self._seen.add(value)
+                    return value
+
+
+class GenerationController:
+    def __init__(
+        self,
+        config: AppConfig,
+        cache: SeedCache,
+        provider: WorldGenerationProvider,
+        state_path: Path,
+        logger: logging.Logger,
+        on_progress: Callable[[Progress], None] | None = None,
+        target: int | None = None,
+        pool: str = "overworld",
+    ):
+        self.config, self.cache, self.provider, self.pool = config, cache, provider, pool
+        self.state_path, self.logger, self.on_progress = state_path, logger, on_progress
+        self.progress = Progress(target=config.target_seeds if target is None else target, started_at=time.monotonic())
+        self.pause_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.pause_event.set()
+        self._progress_lock = threading.Lock()
+        self._candidate_stream = CandidateStream(config.master_rng_seed)
+
+    def pause(self) -> None:
+        self.pause_event.clear()
+
+    def resume(self) -> None:
+        self.pause_event.set()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.pause_event.set()
+
+    def run(self) -> Progress:
+        if self.progress.target == 0:
+            self.progress.finished = True
+            return self.progress
+        workers = self.config.workers or max(1, (os.cpu_count() or 2) - 1)
+        self.logger.info("generation start version=%s filter=%s target=%s workers=%s", self.config.minecraft_version, self.config.filter_version, self.progress.target, workers)
+        threads = [threading.Thread(target=self._worker, name=f"seed-worker-{i}", daemon=True) for i in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.progress.finished = True
+        self._checkpoint()
+        self.cache.export(self.progress.found)
+        self.logger.info("generation complete found=%s candidates=%s", self.progress.found, self.progress.candidates)
+        return self.progress
+
+    def _worker(self) -> None:
+        while not self.stop_event.is_set():
+            self.pause_event.wait()
+            with self._progress_lock:
+                if self.progress.found >= self.progress.target:
+                    self.stop_event.set()
+                    return
+            candidate = self._candidate_stream.next()
+            with self._progress_lock:
+                self.progress.candidates += 1
+            try:
+                checker = getattr(self.provider, "check_seed", None)
+                report = checker(candidate, self.pool, self.config.filters) if checker else None
+                accepted = bool(report.get("matched")) if report is not None else self.provider.accepts(candidate, self.config.filters, self.pool)
+            except GenerationUnavailableError as exc:
+                self.progress.error = str(exc)
+                self.stop_event.set()
+                return
+            if not accepted:
+                with self._progress_lock:
+                    self.progress.rejected += 1
+                continue
+            with self._progress_lock:
+                if self.progress.found >= self.progress.target:
+                    self.stop_event.set()
+                    return
+                labels = extract_structure_labels(report) if report is not None else ()
+                inserted = self.cache.insert(str(candidate), labels)
+                if not inserted:
+                    self.progress.duplicates += 1
+                    continue
+                self.progress.found += 1
+            self._checkpoint()
+            if self.on_progress:
+                self.on_progress(self.progress)
+
+    def _checkpoint(self) -> None:
+        self.state_path.write_text(json.dumps(self.progress.__dict__, indent=2), encoding="utf-8")
+
+
+def extract_structure_labels(report: dict | None) -> tuple[str, ...]:
+    if not report:
+        return ()
+    labels: list[str] = []
+    aliases = {
+        "desert_pyramid": "desert temple",
+        "ruined_portal": "ruined portal",
+        "buried_treasure": "buried treasure",
+        "bastion_remnant": "bastion",
+    }
+
+    def visit(value: object) -> None:
+        if not isinstance(value, dict):
+            return
+        if value.get("condition") == "structure_near" and value.get("matched"):
+            names = []
+            for hit in value.get("hits", []):
+                if isinstance(hit, dict) and hit.get("name"):
+                    names.append(str(hit["name"]))
+            for name in names:
+                label = aliases.get(name, name)
+                if label not in labels:
+                    labels.append(label)
+        for child in value.get("children", []):
+            visit(child)
+
+    visit(report.get("filter"))
+    return tuple(labels)

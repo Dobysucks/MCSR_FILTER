@@ -1,0 +1,1 @@
+{"version": "26.2", "conditions": [{"type": "structure_near", "any_of": ["bastion_remnant"], "radius": 224, "anchor": "nether_spawn", "dimension": "nether"}]}

@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any
+
+from .config import FILTER_NAMES, FilterConfig, MINECRAFT_VERSION
+from .backend import (
+    BACKEND_NAME,
+    BACKEND_PROGRAM_VERSION,
+    MINECRAFT_VERSION,
+    PINNED_COMMIT,
+    TRUSTED_BACKEND_SHA256,
+    user_backend_dir,
+)
+
+
+class GenerationUnavailableError(RuntimeError):
+    """Raised when exact Minecraft 26.2 verification is unavailable."""
+
+
+@dataclass(frozen=True)
+class ProviderSelfTest:
+    verified: bool
+    provider_name: str
+    version: str
+    message: str
+    minecraft_version: str = MINECRAFT_VERSION
+    commit: str = PINNED_COMMIT
+    sha256: str = ""
+
+
+class IMinecraft26WorldGenProvider(ABC):
+    """Version-specific world-generation boundary used by the MCSR engine."""
+
+    version = MINECRAFT_VERSION
+    name = "unavailable"
+    openTerrainSupported = False
+    lavaPoolSupported = False
+
+    @abstractmethod
+    def self_test(self) -> ProviderSelfTest:
+        raise NotImplementedError
+
+    @abstractmethod
+    def accepts(self, seed: int, filters: FilterConfig, pool: str = "overworld") -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def verify_seed(self, seed: int, pool: str, filters: FilterConfig) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_world_generation_version(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def find_lava_pool(self, seed: int, pool: str) -> dict[str, int] | None:
+        """Optional observation; absence must never reject an otherwise valid seed."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def check_open_terrain(self, seed: int, pool: str, first: dict[str, Any], second: dict[str, Any] | None = None) -> bool:
+        raise NotImplementedError
+
+
+WorldGenerationProvider = IMinecraft26WorldGenProvider
+
+
+class UnavailableMinecraft262Provider(IMinecraft26WorldGenProvider):
+    name = "No provider"
+
+    def self_test(self) -> ProviderSelfTest:
+        return ProviderSelfTest(False, self.name, "", "No verified Minecraft 26.2 backend is installed.")
+
+    def accepts(self, seed: int, filters: FilterConfig, pool: str = "overworld") -> bool:
+        raise GenerationUnavailableError(
+            "Minecraft Java 26.2 world-generation provider verification failed. "
+            "Seed generation has been disabled to prevent inaccurate results."
+        )
+
+    def verify_seed(self, seed: int, pool: str, filters: FilterConfig) -> dict[str, Any]:
+        raise GenerationUnavailableError("No Minecraft Java 26.2 provider is available.")
+
+    def get_world_generation_version(self) -> str:
+        return MINECRAFT_VERSION
+
+    def find_lava_pool(self, seed: int, pool: str) -> dict[str, int] | None:
+        raise GenerationUnavailableError("Lava-pool lookup is unavailable without the 26.2 backend.")
+
+    def check_open_terrain(self, seed: int, pool: str, first: dict[str, Any], second: dict[str, Any] | None = None) -> bool:
+        raise GenerationUnavailableError("Open-terrain lookup is unavailable without the 26.2 backend.")
+
+
+class MCSeedFinderProvider(IMinecraft26WorldGenProvider):
+    """Adapter for 69gg/MCSeedFinder's vendored, explicit 26.2 backend."""
+
+    name = "MCSeedFinder 26.2"
+
+    def __init__(self, executable: Path):
+        self.executable = executable
+        self._verified = False
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(self.executable), *args],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=120,
+        )
+
+    def self_test(self) -> ProviderSelfTest:
+        if not self.executable.exists():
+            return ProviderSelfTest(False, self.name, "", f"Backend not found: {self.executable}")
+        try:
+            if self.executable.name.lower() != BACKEND_NAME:
+                return ProviderSelfTest(False, self.name, "", "Backend executable identity is not mcseed-finder.exe.")
+            digest = hashlib.sha256(self.executable.read_bytes()).hexdigest().upper()
+            if digest != TRUSTED_BACKEND_SHA256:
+                return ProviderSelfTest(False, self.name, "", "Backend SHA-256 does not match the trusted pinned artifact.", sha256=digest)
+            version = self._run("--version")
+            structures = self._run("list", "structures", "--json")
+            program_output = (version.stdout or "") + (version.stderr or "")
+            if version.returncode != 0 or f"mcseed-finder {BACKEND_PROGRAM_VERSION}" not in program_output:
+                return ProviderSelfTest(False, self.name, "", "Backend did not report the trusted mcseed-finder program version.", sha256=digest)
+            if structures.returncode != 0:
+                return ProviderSelfTest(False, self.name, BACKEND_PROGRAM_VERSION, "Structure registry self-test failed.", sha256=digest)
+            available = json.loads(structures.stdout)
+            required = {"village", "shipwreck", "desert_pyramid", "ruined_portal", "buried_treasure", "bastion_remnant", "fortress"}
+            names = {str(item.get("name", item)) if isinstance(item, dict) else str(item) for item in available}
+            if not required.issubset(names):
+                return ProviderSelfTest(False, self.name, BACKEND_PROGRAM_VERSION, "Required 26.2 structure registry entries are missing.", sha256=digest)
+            overworld_filters = (
+                ("village", FilterConfig(village=True, shipwreck=False, desert_temple=False, ruined_portal=False, buried_treasure=False, bastion=False, fortress=False)),
+                ("shipwreck", FilterConfig(village=False, shipwreck=True, desert_temple=False, ruined_portal=False, buried_treasure=False, bastion=False, fortress=False)),
+                ("desert temple", FilterConfig(village=False, shipwreck=False, desert_temple=True, ruined_portal=False, buried_treasure=False, bastion=False, fortress=False)),
+                ("ruined portal", FilterConfig(village=False, shipwreck=False, desert_temple=False, ruined_portal=True, buried_treasure=False, bastion=False, fortress=False)),
+                ("buried treasure", FilterConfig(village=False, shipwreck=False, desert_temple=False, ruined_portal=False, buried_treasure=True, bastion=False, fortress=False)),
+            )
+            for label, structure_filters in overworld_filters:
+                report = self._check(0, "overworld", structure_filters)
+                if report.get("version") != MINECRAFT_VERSION or report.get("seed") != 0 or "spawn" not in report:
+                    return ProviderSelfTest(False, self.name, BACKEND_PROGRAM_VERSION, f"Overworld {label} lookup failed.", sha256=digest)
+            for label, structure_filters in (
+                ("bastion", FilterConfig(village=False, shipwreck=False, desert_temple=False, ruined_portal=False, buried_treasure=False, bastion=True, fortress=False)),
+                ("fortress", FilterConfig(village=False, shipwreck=False, desert_temple=False, ruined_portal=False, buried_treasure=False, bastion=False, fortress=True)),
+            ):
+                nether_report = self._check(0, "nether", structure_filters)
+                if nether_report.get("version") != MINECRAFT_VERSION or nether_report.get("seed") != 0:
+                    return ProviderSelfTest(False, self.name, BACKEND_PROGRAM_VERSION, f"Nether {label} lookup failed.", sha256=digest)
+            self._verified = True
+            return ProviderSelfTest(
+                True,
+                self.name,
+                BACKEND_PROGRAM_VERSION,
+                "MCSeedFinder structure interface passed for the explicitly configured Minecraft 26.2 target.",
+                sha256=digest,
+            )
+        except (OSError, ValueError, KeyError, GenerationUnavailableError, subprocess.TimeoutExpired) as exc:
+            return ProviderSelfTest(False, self.name, "", f"Provider self-test failed: {exc}")
+
+    def _check(self, seed: int, pool: str, filters: FilterConfig) -> dict[str, Any]:
+        conditions: list[dict[str, Any]] = []
+        if pool == "overworld":
+            backend_names = {"desert_temple": "desert_pyramid"}
+            structures = [backend_names.get(name, name) for name in ("village", "shipwreck", "desert_temple", "ruined_portal", "buried_treasure") if getattr(filters, name)]
+            anchor = "spawn"
+            dimension = None
+        else:
+            backend_names = {"bastion": "bastion_remnant"}
+            structures = [backend_names.get(name, name) for name in ("bastion", "fortress") if getattr(filters, name)]
+            anchor = "nether_spawn"
+            dimension = "nether"
+        if structures:
+            condition: dict[str, Any] = {"type": "all", "conditions": []}
+            if dimension:
+                condition["conditions"] = [{"type": "structure_near", "any_of": [structure], "radius": 4096, "anchor": anchor, "dimension": dimension} for structure in structures]
+            else:
+                condition["conditions"] = [{"type": "structure_near", "any_of": [structure], "radius": 4096, "anchor": anchor} for structure in structures]
+            conditions.append(condition)
+        with NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as handle:
+            json.dump({"version": MINECRAFT_VERSION, "conditions": conditions}, handle)
+            config_path = handle.name
+        try:
+            result = self._run("check", str(seed), "--config", config_path, "--format", "jsonl")
+            if result.returncode not in (0, 1):
+                raise GenerationUnavailableError(result.stderr.strip() or "MCSeedFinder rejected the check.")
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            if not lines:
+                raise GenerationUnavailableError(result.stderr.strip() or "MCSeedFinder returned no check result.")
+            return json.loads(lines[-1])
+        finally:
+            os.unlink(config_path)
+
+    def accepts(self, seed: int, filters: FilterConfig, pool: str = "overworld") -> bool:
+        return bool(self.check_seed(seed, pool, filters).get("matched"))
+
+    def check_seed(self, seed: int, pool: str, filters: FilterConfig) -> dict[str, Any]:
+        if not self._verified:
+            raise GenerationUnavailableError("Provider self-test has not passed.")
+        report = self._check(seed, pool, filters)
+        if pool == "nether" and self.openTerrainSupported and report.get("matched"):
+            report["matched"] = self.check_open_terrain(seed, pool, report)
+        return report
+
+    def verify_seed(self, seed: int, pool: str, filters: FilterConfig) -> dict[str, Any]:
+        report = self.check_seed(seed, pool, filters)
+        report["terrain_check"] = "VERIFIED" if self.openTerrainSupported else "NOT_AVAILABLE"
+        return report
+
+    def get_world_generation_version(self) -> str:
+        return MINECRAFT_VERSION
+
+    def find_lava_pool(self, seed: int, pool: str) -> dict[str, int] | None:
+        return None
+
+    def check_open_terrain(self, seed: int, pool: str, first: dict[str, Any], second: dict[str, Any] | None = None) -> bool:
+        raise GenerationUnavailableError(
+            "MCSeedFinder commit 9087c5dc64f2bc12d55609f44ff85fb5b14fc802 "
+            "does not expose the required Nether open-terrain/accessibility query through its public CLI."
+        )
+
+
+def create_provider(workdir: Path | None = None) -> IMinecraft26WorldGenProvider:
+    root = workdir or Path.cwd()
+    executable_root = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else root
+    bundled = executable_root / "backend" / "mcseed-finder.exe"
+    local = root / "mcseed-finder.exe"
+    configured = Path(os.environ["MCSEED_FINDER_EXE"]) if os.environ.get("MCSEED_FINDER_EXE") else None
+    candidates = [bundled, local]
+    candidates.append(user_backend_dir() / "mcseed-finder.exe")
+    if configured:
+        candidates.append(configured)
+    path_backend = shutil.which("mcseed-finder.exe") or shutil.which("mcseed-finder")
+    if path_backend:
+        candidates.append(Path(path_backend))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return MCSeedFinderProvider(candidate)
+    return UnavailableMinecraft262Provider()

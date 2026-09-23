@@ -1,0 +1,1 @@
+{"version":"26.2","conditions":[{"type":"structure_piece_near","structure":"village","any_of":["blacksmith"],"anchor":"spawn","radius":112,"min_count":1}]}
