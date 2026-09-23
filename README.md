@@ -457,6 +457,8 @@ Minecraft is a trademark of Mojang Studios/Microsoft.
 
 Use this project at your own discretion and verify generated seeds in your intended Minecraft/MCSR environment before relying on them for gameplay.
 
+PROJECT WAS CREATED WITH HELP OF AI.
+
 ---
 
 # Credits
