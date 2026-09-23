@@ -1,4 +1,4 @@
-﻿# MCSR_FILTER
+﻿# MCSR_FILTER :D
 
 A Windows-friendly Minecraft Java 26.2 seed filtering tool for generating large, persistent pools of Overworld and Nether seeds using the native MCSeedFinder backend.
 
